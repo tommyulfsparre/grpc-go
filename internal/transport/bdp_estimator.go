@@ -21,6 +21,8 @@ package transport
 import (
 	"sync"
 	"time"
+
+	"google.golang.org/grpc/internal/envconfig"
 )
 
 const (
@@ -40,6 +42,9 @@ const (
 	// we should multiply our current sample with 4/3, however to round things out
 	// we use 2 as the multiplication factor.
 	gamma = 2
+	// maxPingBackoff caps the backoff so that the estimator keeps probing
+	// for growth at least once every maxPingBackoff*bdp/2 bytes.
+	maxPingBackoff = 10
 )
 
 // Adding arbitrary data to ping so that its ack can be identified.
@@ -52,7 +57,8 @@ type bdpEstimator struct {
 	sentAt time.Time
 	// bdp is the current bdp estimate.
 	bdp uint32
-	// sample is the number of bytes received in one measurement cycle.
+	// sample is the number of bytes received since the last bdp ping was
+	// sent. At the ack it is the number of bytes received in one round trip.
 	sample uint32
 	// bwMax is the maximum bandwidth noted so far (bytes/sec).
 	bwMax float64
@@ -64,6 +70,9 @@ type bdpEstimator struct {
 	sampleCount uint64
 	// round trip time (seconds)
 	rtt float64
+	// backoff is the number of samples in a row that did not grow the
+	// estimate, up to maxPingBackoff.
+	backoff uint32
 }
 
 // timesnap registers the time bdp ping was sent out so that
@@ -83,21 +92,26 @@ func (b *bdpEstimator) timesnap(d [8]byte) {
 // It returns true only if a ping must be sent. This can be used
 // by the caller (handleData) to make decision about batching
 // a window update with it.
+//
+// After backoff samples in a row that did not grow the estimate, the next
+// ping waits until backoff*bdp/2 bytes have arrived since the last one.
+// Small messages then cost few pings. Bulk traffic covers the wait within a
+// few round trips so the window still grows.
 func (b *bdpEstimator) add(n uint32) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.bdp == bdpLimit {
 		return false
 	}
-	if !b.isSent {
-		b.isSent = true
-		b.sample = n
-		b.sentAt = time.Time{}
-		b.sampleCount++
-		return true
-	}
 	b.sample += n
-	return false
+	if b.isSent || (envconfig.EnableBDPPingBackoff && b.sample < b.backoff*(b.bdp/2)) {
+		return false
+	}
+	b.isSent = true
+	b.sample = n
+	b.sentAt = time.Time{}
+	b.sampleCount++
+	return true
 }
 
 // calculate is called when an ack for a bdp ping is received.
@@ -109,6 +123,15 @@ func (b *bdpEstimator) calculate(d [8]byte) {
 		return
 	}
 	b.mu.Lock()
+	// Ignore an ack with no BDP ping outstanding. Before the first ping
+	// sampleCount is 0. The rtt update would divide by it and leave rtt NaN
+	// so the estimate would never grow again. Between pings sample keeps
+	// counting toward the backoff. A stray ack would turn many round trips of
+	// data into one sample.
+	if !b.isSent {
+		b.mu.Unlock()
+		return
+	}
 	rttSample := time.Since(b.sentAt).Seconds()
 	if b.sampleCount < 10 {
 		// Bootstrap rtt with an average of first 10 rtt samples.
@@ -133,10 +156,15 @@ func (b *bdpEstimator) calculate(d [8]byte) {
 		if b.bdp > bdpLimit {
 			b.bdp = bdpLimit
 		}
+		// Probe every round trip again while the window grows.
+		b.backoff = 0
 		bdp := b.bdp
 		b.mu.Unlock()
 		b.updateFlowControl(bdp)
 		return
+	}
+	if b.backoff < maxPingBackoff {
+		b.backoff++
 	}
 	b.mu.Unlock()
 }

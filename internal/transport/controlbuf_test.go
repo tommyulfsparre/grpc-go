@@ -187,8 +187,8 @@ func (s) TestControlBuffer_Throttle(t *testing.T) {
 		side side
 		item cbItem
 	}{
-		// All pings count, not only acks, since the peer can trigger a
-		// BDP ping with every DATA frame.
+		// All pings count, not only acks, since the peer can trigger BDP
+		// pings with DATA frames.
 		{name: "client_ping", side: clientSide, item: &ping{}},
 		{name: "client_pingAck", side: clientSide, item: &ping{ack: true}},
 		{name: "client_incomingSettings", side: clientSide, item: &incomingSettings{}},

@@ -159,6 +159,16 @@ var (
 	//
 	// TODO: Remove this env var once v1.85.0 is released.
 	EnableReceiveBufferCompaction = boolFromEnv("GRPC_GO_EXPERIMENTAL_ENABLE_RECEIVE_BUFFER_COMPACTION", true)
+
+	// EnableBDPPingBackoff makes the BDP estimator send pings less often
+	// while its estimate does not grow.
+	//
+	// This environment variable serves as an escape hatch to disable the
+	// feature if unforeseen issues arise, and it will be removed in a future
+	// release.
+	//
+	// TODO: Remove this env var once v1.86.0 is released.
+	EnableBDPPingBackoff = boolFromEnv("GRPC_GO_EXPERIMENTAL_ENABLE_BDP_PING_BACKOFF", true)
 )
 
 func boolFromEnv(envVar string, def bool) bool {

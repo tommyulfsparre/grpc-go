@@ -32,6 +32,8 @@ import (
 
 	"golang.org/x/net/http2"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/internal/envconfig"
+	"google.golang.org/grpc/internal/testutils"
 	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/resolver"
 )
@@ -115,6 +117,8 @@ func newClientTransportOverConn(ctx context.Context, t *testing.T, conn net.Conn
 // once too many such items are queued, and to close the connection if reads
 // stay throttled for clientThrottleTimeout.
 func (s) TestClientTransport_ServerFloodWithoutReading(t *testing.T) {
+	// The BDP_PING case needs a BDP ping for every DATA frame.
+	testutils.SetEnvConfig(t, &envconfig.EnableBDPPingBackoff, false)
 	tests := []struct {
 		name string
 		// flood writes one round of the flood to the client.
@@ -133,12 +137,13 @@ func (s) TestClientTransport_ServerFloodWithoutReading(t *testing.T) {
 			flood: func(fr *http2.Framer) error { return fr.WriteWindowUpdate(0, 1) },
 		},
 		{
-			// A DATA frame of any size results in the client
-			// queuing a BDP ping if there is no BDP ping
-			// outstanding. Since the BDP ping has a fixed payload,
-			// the server can ack it before it is even written by
-			// the client, to make the client queue another BDP
-			// ping on the next DATA frame.
+			// With the BDP ping backoff disabled a DATA frame of
+			// any size results in the client queuing a BDP ping
+			// if there is no BDP ping outstanding. Since the BDP
+			// ping has a fixed payload, the server can ack it
+			// before it is even written by the client, to make
+			// the client queue another BDP ping on the next DATA
+			// frame.
 			name: "BDP_PING",
 			flood: func(fr *http2.Framer) error {
 				if err := fr.WriteData(1, false, nil); err != nil {
@@ -486,23 +491,17 @@ func (s) TestClientTransport_StreamCleanupDoesNotThrottleReads(t *testing.T) {
 	}
 }
 
-// Tests that a server transport does not queue an unbounded number of BDP
-// pings in its control buffer when a client floods it with DATA frames, each
-// followed by an ack for the BDP ping, while not reading from the connection.
-// The server queues a BDP ping for a DATA frame of any size, on any stream,
-// whenever there is no BDP ping outstanding. And since the BDP ping has a
-// fixed payload, the client can ack it before it is even written by the
-// server. The server is expected to stop reading from the connection once too
-// many pings are queued.
-func (s) TestServerTransport_BDPPingFloodWithoutReading(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer cancel()
-
+// newServerTransportOverPipe creates a server transport over a net.Pipe and
+// acts as the client. The client stops reading from the connection once the
+// server acks its settings. So the server's writer blocks on the next frame it
+// writes. It returns a framer and a conn for the client side of the pipe.
+func newServerTransportOverPipe(ctx context.Context, t *testing.T) (*http2Server, *http2.Framer, net.Conn) {
+	t.Helper()
 	sConn, cConn := net.Pipe()
-	defer func() {
+	t.Cleanup(func() {
 		sConn.Close()
 		cConn.Close()
-	}()
+	})
 
 	type result struct {
 		st  ServerTransport
@@ -521,8 +520,6 @@ func (s) TestServerTransport_BDPPingFloodWithoutReading(t *testing.T) {
 		resultCh <- result{st: st, err: err}
 	}()
 
-	// Act as the client. Read frames from the server until it acks the
-	// client's settings, and stop reading from the connection after that.
 	// Frames need to be read concurrently with the client preface being
 	// written, since writes on a net.Pipe block until the data is read.
 	settingsAckRead := make(chan error, 1)
@@ -566,10 +563,10 @@ func (s) TestServerTransport_BDPPingFloodWithoutReading(t *testing.T) {
 		defer close(handleStreamsDone)
 		st.HandleStreams(ctx, func(*ServerStream) {})
 	}()
-	defer func() {
+	t.Cleanup(func() {
 		st.Close(errors.New("test done"))
 		<-handleStreamsDone
-	}()
+	})
 
 	select {
 	case err := <-settingsAckRead:
@@ -579,6 +576,23 @@ func (s) TestServerTransport_BDPPingFloodWithoutReading(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("Timeout when waiting for the server to ack the client's settings")
 	}
+	return st, fr, cConn
+}
+
+// Tests that a server transport does not queue an unbounded number of BDP
+// pings in its control buffer when a client floods it with DATA frames, each
+// followed by an ack for the BDP ping, while not reading from the connection.
+// With the BDP ping backoff disabled the server queues a BDP ping for a DATA
+// frame of any size, on any stream, whenever there is no BDP ping outstanding.
+// And since the BDP ping has a fixed payload, the client can ack it before it
+// is even written by the server. The server is expected to stop reading from
+// the connection once too many pings are queued.
+func (s) TestServerTransport_BDPPingFloodWithoutReading(t *testing.T) {
+	testutils.SetEnvConfig(t, &envconfig.EnableBDPPingBackoff, false)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+
+	st, fr, cConn := newServerTransportOverPipe(ctx, t)
 
 	// Flood the server. Since the client is not reading anymore, the
 	// server's writer blocks when writing the first BDP ping, and the
@@ -626,5 +640,138 @@ func (s) TestServerTransport_BDPPingFloodWithoutReading(t *testing.T) {
 	}
 	if numPings := countQueuedItems[*ping](st.controlBuf); numPings > maxQueuedTransportResponseFrames {
 		t.Fatalf("Number of queued pings = %d, want <= %d", numPings, maxQueuedTransportResponseFrames)
+	}
+}
+
+// floodBDPPingAcks writes numRounds rounds of an empty DATA frame followed by
+// an ack for the BDP ping. It returns the number of rounds written and the
+// first write error.
+func floodBDPPingAcks(fr *http2.Framer, numRounds int) (int, error) {
+	for i := range numRounds {
+		if err := fr.WriteData(1, false, nil); err != nil {
+			return i, err
+		}
+		if err := fr.WritePing(true, bdpPing.data); err != nil {
+			return i, err
+		}
+	}
+	return numRounds, nil
+}
+
+// waitForFloodWithoutThrottle waits until floodDone is closed. It fails the
+// test as soon as cb throttles reads. A throttled flood would otherwise block
+// until ctx expires.
+func waitForFloodWithoutThrottle(ctx context.Context, t *testing.T, cb *controlBuffer, floodDone <-chan struct{}) {
+	t.Helper()
+	for cb.trfChan.Load() == nil {
+		select {
+		case <-floodDone:
+			return
+		case <-ctx.Done():
+			t.Fatal("Timeout when waiting for the flood to end")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	t.Fatal("Reads throttled during the flood, want no throttling")
+}
+
+// Tests that the BDP ping backoff keeps a client transport from queuing more
+// than one BDP ping when a server floods it with empty DATA frames, each
+// followed by an ack for the BDP ping, while not reading from the connection.
+// The first ack is a sample that does not grow the estimate. Empty DATA frames
+// add no bytes after that. So the client never reaches the threshold for the
+// next BDP ping.
+func (s) TestClientTransport_BDPPingBackoffLimitsFlood(t *testing.T) {
+	testutils.SetEnvConfig(t, &envconfig.EnableBDPPingBackoff, true)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+
+	// Queuing a BDP ping per round would throttle reads.
+	numRounds := 2 * maxQueuedTransportResponseFrames
+	sConn, cConn := net.Pipe()
+	var roundsWritten int
+	var floodErr error
+	floodDone := make(chan struct{})
+	go func() {
+		defer close(floodDone)
+		fr, err := fakeServerHandshake(sConn)
+		if err != nil {
+			floodErr = err
+			return
+		}
+		// The flood writes to the stream that the test creates. Stop
+		// reading once its HEADERS frame arrives.
+		for {
+			f, err := fr.ReadFrame()
+			if err != nil {
+				floodErr = fmt.Errorf("error reading frame from the client: %v", err)
+				return
+			}
+			if _, ok := f.(*http2.HeadersFrame); ok {
+				break
+			}
+		}
+		roundsWritten, floodErr = floodBDPPingAcks(fr, numRounds)
+	}()
+	defer func() {
+		// Closing the server side of the connection unblocks the
+		// flood, if blocked.
+		sConn.Close()
+		<-floodDone
+	}()
+
+	ct, cleanup := newClientTransportOverConn(ctx, t, cConn, defaultTestTimeout, func(GoAwayInfo) {})
+	defer func() {
+		// Closing the server side of the connection unblocks the
+		// client's writer.
+		sConn.Close()
+		cleanup()
+	}()
+	if _, err := ct.NewStream(ctx, &CallHdr{}, nil); err != nil {
+		t.Fatalf("NewStream() failed: %v", err)
+	}
+
+	waitForFloodWithoutThrottle(ctx, t, ct.controlBuf, floodDone)
+	if floodErr != nil {
+		t.Fatalf("Flood ended after %d of %d rounds: %v", roundsWritten, numRounds, floodErr)
+	}
+	// The writer may hold the first BDP ping while it blocks on writing it.
+	if numPings := countQueuedItems[*ping](ct.controlBuf); numPings > 1 {
+		t.Fatalf("Number of queued pings = %d, want <= 1", numPings)
+	}
+}
+
+// Tests that the BDP ping backoff keeps a server transport from queuing more
+// than one BDP ping when a client floods it with empty DATA frames, each
+// followed by an ack for the BDP ping, while not reading from the connection.
+func (s) TestServerTransport_BDPPingBackoffLimitsFlood(t *testing.T) {
+	testutils.SetEnvConfig(t, &envconfig.EnableBDPPingBackoff, true)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	st, fr, cConn := newServerTransportOverPipe(ctx, t)
+
+	// Queuing a BDP ping per round would throttle reads.
+	numRounds := 2 * maxQueuedTransportResponseFrames
+	var roundsWritten int
+	var floodErr error
+	floodDone := make(chan struct{})
+	go func() {
+		defer close(floodDone)
+		roundsWritten, floodErr = floodBDPPingAcks(fr, numRounds)
+	}()
+	defer func() {
+		// Closing the client side of the connection unblocks the
+		// flood, if blocked.
+		cConn.Close()
+		<-floodDone
+	}()
+
+	waitForFloodWithoutThrottle(ctx, t, st.controlBuf, floodDone)
+	if floodErr != nil {
+		t.Fatalf("Flood ended after %d of %d rounds: %v", roundsWritten, numRounds, floodErr)
+	}
+	// The writer may hold the first BDP ping while it blocks on writing it.
+	if numPings := countQueuedItems[*ping](st.controlBuf); numPings > 1 {
+		t.Fatalf("Number of queued pings = %d, want <= 1", numPings)
 	}
 }

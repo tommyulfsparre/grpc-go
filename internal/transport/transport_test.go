@@ -1520,6 +1520,228 @@ func (s) TestServerWithMisbehavedClient(t *testing.T) {
 	}
 }
 
+// TestServerBDPPingBackoffWithSmallMessages checks that the gap between a
+// server's BDP pings grows when a client sends small messages one at a time.
+// Each message waits for the echo of the previous one. So every BDP ping is
+// acked before the next message and no sample grows the estimate.
+func (s) TestServerBDPPingBackoffWithSmallMessages(t *testing.T) {
+	testutils.SetEnvConfig(t, &envconfig.EnableBDPPingBackoff, true)
+	server := setUpServerOnly(t, 0, &ServerConfig{BufferPool: mem.DefaultBufferPool()}, pingpong)
+	defer server.stop()
+	conn, err := net.Dial("tcp", server.lis.Addr().String())
+	if err != nil {
+		t.Fatalf("Failed to dial: %v", err)
+	}
+	if err := conn.SetDeadline(time.Now().Add(defaultTestTimeout)); err != nil {
+		t.Fatalf("Failed to set deadline: %v", err)
+	}
+	if _, err := conn.Write(clientPreface); err != nil {
+		t.Fatalf("Failed to write client preface: %v", err)
+	}
+	var mu sync.Mutex // Guards writes on framer.
+	framer := http2.NewFramer(conn, conn)
+	// Let the server echo every message without waiting for window updates.
+	if err := framer.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: math.MaxInt32}); err != nil {
+		t.Fatalf("Failed to write settings: %v", err)
+	}
+	if err := framer.WriteWindowUpdate(0, math.MaxInt32-initialWindowSize); err != nil {
+		t.Fatalf("Failed to write window update: %v", err)
+	}
+
+	var bdpPings atomic.Int32
+	echoed := make(chan int)
+	trailersRead := make(chan struct{})
+	testDone := make(chan struct{})
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		for {
+			f, err := framer.ReadFrame()
+			if err != nil {
+				return
+			}
+			switch f := f.(type) {
+			case *http2.PingFrame:
+				if f.IsAck() {
+					continue
+				}
+				if f.Data == bdpPing.data {
+					bdpPings.Add(1)
+				}
+				// Ack before the next message is written so that
+				// the server sees the ack first.
+				mu.Lock()
+				err := framer.WritePing(true, f.Data)
+				mu.Unlock()
+				if err != nil {
+					return
+				}
+			case *http2.DataFrame:
+				if n := len(f.Data()); n > 0 {
+					select {
+					case echoed <- n:
+					case <-testDone:
+						return
+					}
+				}
+			case *http2.HeadersFrame:
+				if f.StreamEnded() {
+					close(trailersRead)
+				}
+			}
+		}
+	}()
+	defer func() {
+		close(testDone)
+		conn.Close()
+		<-readerDone
+	}()
+
+	var buf bytes.Buffer
+	henc := hpack.NewEncoder(&buf)
+	for _, hf := range []hpack.HeaderField{
+		{Name: ":method", Value: "POST"},
+		{Name: ":path", Value: "/foo/bar"},
+		{Name: ":authority", Value: "localhost"},
+		{Name: "content-type", Value: "application/grpc"},
+	} {
+		if err := henc.WriteField(hf); err != nil {
+			t.Fatalf("Failed to encode header %q: %v", hf.Name, err)
+		}
+	}
+	mu.Lock()
+	err = framer.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: buf.Bytes(), EndHeaders: true})
+	mu.Unlock()
+	if err != nil {
+		t.Fatalf("Failed to write headers: %v", err)
+	}
+
+	const numMessages = 2000
+	msg := make([]byte, 5+100)
+	binary.BigEndian.PutUint32(msg[1:], uint32(len(msg)-5))
+	for i := range numMessages {
+		mu.Lock()
+		err := framer.WriteData(1, false, msg)
+		mu.Unlock()
+		if err != nil {
+			t.Fatalf("Failed to write message %d: %v", i, err)
+		}
+		for got := 0; got < len(msg); {
+			select {
+			case n := <-echoed:
+				got += n
+			case <-readerDone:
+				t.Fatalf("Connection closed while waiting for the echo of message %d", i)
+			}
+		}
+	}
+
+	// Wait for the trailers so that the server's handler sees the end of the
+	// stream before the connection closes.
+	mu.Lock()
+	err = framer.WriteData(1, true, nil)
+	mu.Unlock()
+	if err != nil {
+		t.Fatalf("Failed to end the stream: %v", err)
+	}
+	select {
+	case <-trailersRead:
+	case <-readerDone:
+		t.Fatal("Connection closed while waiting for the server's trailers")
+	}
+
+	// With 105-byte frames the backoff makes the server ping on messages 0,
+	// 312, 936 and 1872. Each ping is acked before the next message arrives.
+	// So the count is exact.
+	const wantPings = 4
+	if got := bdpPings.Load(); got != wantPings {
+		t.Fatalf("Server sent %d BDP pings for %d messages, want %d", got, numMessages, wantPings)
+	}
+}
+
+// TestBDPWindowGrowsAfterSmallMessages checks that both sides still grow their
+// flow control windows for large messages when their BDP ping backoff is at
+// its cap.
+func (s) TestBDPWindowGrowsAfterSmallMessages(t *testing.T) {
+	testutils.SetEnvConfig(t, &envconfig.EnableBDPPingBackoff, true)
+	server, client, cancel := setUp(t, 0, pingpong)
+	defer cancel()
+	defer server.stop()
+	defer client.Close(errors.New("closed manually by test"))
+	waitWhileTrue(t, func() (bool, error) {
+		server.mu.Lock()
+		defer server.mu.Unlock()
+		if len(server.conns) == 0 {
+			return true, fmt.Errorf("timed out while waiting for server transport to be created")
+		}
+		return false, nil
+	})
+	var st *http2Server
+	server.mu.Lock()
+	for k := range server.conns {
+		st = k.(*http2Server)
+	}
+	server.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	stream, err := client.NewStream(ctx, &CallHdr{}, nil)
+	if err != nil {
+		t.Fatalf("NewStream() failed: %v", err)
+	}
+	pingPong := func(size int) {
+		t.Helper()
+		buf := make([]byte, size+5)
+		binary.BigEndian.PutUint32(buf[1:], uint32(size))
+		if err := stream.Write(nil, newBufferSlice(buf), &WriteOptions{}); err != nil {
+			t.Fatalf("Failed to write message of %d bytes: %v", size, err)
+		}
+		if _, err := stream.readTo(make([]byte, len(buf))); err != nil {
+			t.Fatalf("Failed to read echo of %d bytes: %v", size, err)
+		}
+	}
+
+	sides := []struct {
+		name string
+		b    *bdpEstimator
+	}{{"client", client.bdpEst}, {"server", st.bdpEst}}
+
+	const numMessages = 1000
+	for range numMessages {
+		pingPong(100)
+	}
+	// With 105-byte frames each side pings on messages 0, 312 and 936. Each
+	// ping is acked before the next message arrives. So the count is exact.
+	const wantPings = 3
+	for _, side := range sides {
+		side.b.mu.Lock()
+		bdp, pings := side.b.bdp, side.b.sampleCount
+		// The largest backoff delays the first growth the most.
+		side.b.backoff = maxPingBackoff
+		side.b.mu.Unlock()
+		if bdp != initialWindowSize || pings != wantPings {
+			t.Fatalf("After %d small messages the %s estimate = %d after %d BDP pings, want %d after %d", numMessages, side.name, bdp, pings, initialWindowSize, wantPings)
+		}
+	}
+
+	for range 20 {
+		pingPong(1 << 20)
+	}
+	for _, side := range sides {
+		side.b.mu.Lock()
+		bdp := side.b.bdp
+		side.b.mu.Unlock()
+		if bdp <= initialWindowSize {
+			t.Errorf("After large messages the %s estimate = %d, want more than %d", side.name, bdp, initialWindowSize)
+		}
+	}
+
+	stream.Write(nil, nil, &WriteOptions{Last: true})
+	if _, err := stream.readTo(make([]byte, 5)); err != io.EOF {
+		t.Fatalf("Client expected an EOF from the server. Got: %v", err)
+	}
+}
+
 func (s) TestClientHonorsConnectContext(t *testing.T) {
 	// Create a server that will not send a preface.
 	lis, err := net.Listen("tcp", "localhost:0")

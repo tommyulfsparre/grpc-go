@@ -282,13 +282,13 @@ type ping struct {
 
 // isTransportResponseFrame returns true for all pings, and not only for ping
 // acks sent in response to pings from the peer. This is because a BDP ping is
-// queued in response to a DATA frame (of any size) from the peer, whenever
-// there is no BDP ping outstanding. And since the BDP ping's payload is fixed,
-// the peer can make it look like the BDP ping was acked at any time, by
-// sending a ping ack with that payload. A peer alternating between empty DATA
-// frames and such ping acks would otherwise be able to queue an unbounded
-// number of BDP pings. Pings initiated locally (keepalive and BDP) are rare
-// enough to not cause throttling of well-behaved peers.
+// queued in response to DATA frames from the peer, whenever there is no BDP
+// ping outstanding. And since the BDP ping's payload is fixed, the peer can
+// make it look like the BDP ping was acked at any time, by sending a ping ack
+// with that payload. The BDP estimator backs off after such acks. A peer that
+// sends enough data between them can still queue an unbounded number of BDP
+// pings. Pings initiated locally (keepalive and BDP) are rare enough to not
+// cause throttling of well-behaved peers.
 func (*ping) isTransportResponseFrame(side) bool { return true }
 
 type outFlowControlSizeRequest struct {
